@@ -1,23 +1,25 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// The entry <-> env lifecycle, tuned for this forge: bind an ephemeral port, tell the env the port we
+// bound, then poll until the env says the trial is over and exit 0. The harness (env/src/wire.ts)
+// settles this protocol; the suite scores the server that app.ts builds, so this file stays small.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+//   2. Create the forge server and listen(0): the kernel picks a free port. Never bind 8080, which is
+//      the env's own port on the one-pod layout.
+//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address this request came from
+//      plus N as our base URL and dials it from then on. The first register wins; a 409 means one
+//      already won, and we keep waiting like any other entrant.
+//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once
+//      ({"done": false} while the suite runs), so this is a short poll; the process never exits before
+//      the env says done, and every failed request is retried with a short exponential backoff.
+//   5. Close the server and exit 0. The harness stops the env, which writes the export the scorer reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// This lifecycle imports the forge (./app.ts) and nothing else: no package, no model call, no clock
+// beyond the retry waits the harness allows.
 
 import { createApp } from './app.ts';
 
+/** The env's origin; empty means there is no env to register with and the process exits 1. */
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
@@ -32,7 +34,7 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
+/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped at RETRY_MAX_MS. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
@@ -76,7 +78,7 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
+/** Bind the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
@@ -85,14 +87,14 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  process.stdout.write(`[entry] forge listening on port ${address.port}\n`);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
   server.close();
-  process.stdout.write('[entry] done\n');
+  process.stdout.write('[entry] trial done\n');
 }
 
 try {
