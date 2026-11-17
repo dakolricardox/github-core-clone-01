@@ -12,8 +12,6 @@ import {
   hashObject,
   parseCommit,
   parseTree,
-  readPack,
-  writePack,
   ZERO_OID,
   type GitObject,
 } from './lib/gitlib.ts';
@@ -28,7 +26,6 @@ import {
   buildV2Advertisement,
   parseFetchArgs,
   parsePushCommands,
-  pktDelim,
   pktFlush,
   pktLine,
   tokenize,
