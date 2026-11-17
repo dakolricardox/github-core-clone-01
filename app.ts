@@ -659,9 +659,13 @@ function nodeById(ctx: ForgeContext, kind: string, id: number): Node | null {
 
 function nodeJson(ctx: ForgeContext, node: Node): Record<string, unknown> {
   if (node.kind === 'repo') {
-    return { id: node.id, name: node.name, nameWithOwner: node.nameWithOwner, databaseId: node.databaseId, __kind: 'repo' };
+    return { id: node.id, name: node.name, nameWithOwner: node.nameWithOwner, databaseId: node.databaseId, __kind: 'repo', __repo: repoById(ctx, node.databaseId) };
   }
   return { id: node.id, __kind: node.kind };
+}
+
+function repoById(ctx: ForgeContext, id: number): Repository | undefined {
+  return ctx.store.allRepos().find((r) => r.id === id);
 }
 
 interface ConnResolve {
@@ -702,13 +706,13 @@ function resolveSelection(selection: GqlSelection | null, parent: Record<string,
     let value: unknown;
     let handled = false;
     if (field.name === '__inline') {
-      // An inline fragment (... on Type { }) resolved against this parent: its sub-selection applies
-      // directly to the same parent, and any fields the parent does not hold become null silently
-      // (a fragment on a mismatched type contributes nothing).
-      value = field.sub
-        ? resolveSelection(field.sub, parent, env, resolvers)
-        : {};
+      // An inline fragment (... on Type { }) spreads its fields into the parent selection.
+      if (field.sub) {
+        const merged = resolveSelection(field.sub, parent, env, resolvers);
+        for (const [k, v] of Object.entries(merged)) out[k] = v;
+      }
       handled = true;
+      continue;
     }
     if (field.name === '__typename' && parent.__kind !== undefined) {
       const kind = parent.__kind as string;
@@ -1113,9 +1117,11 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
       const page = Number(query.get('page') ?? '1');
       const start = (page - 1) * perPage;
       const slice = repos.slice(start, start + perPage);
+      const host = req.headers.host ?? 'entry';
+      const origin = `http://${host}`;
       const linkParts: string[] = [];
-      if (page > 1) linkParts.push(`<http://entry/api/v3/user/repos?per_page=${perPage}&page=${page - 1}>; rel="prev"`);
-      if (start + perPage < repos.length) linkParts.push(`<http://entry/api/v3/user/repos?per_page=${perPage}&page=${page + 1}>; rel="next"`);
+      if (page > 1) linkParts.push(`<${origin}/api/v3/user/repos?per_page=${perPage}&page=${page - 1}>; rel="prev"`);
+      if (start + perPage < repos.length) linkParts.push(`<${origin}/api/v3/user/repos?per_page=${perPage}&page=${page + 1}>; rel="next"`);
       const headers: Record<string, string> = {};
       if (linkParts.length > 0) headers.link = linkParts.join(', ');
       sendJson(res, 200, slice.map(repoJson), headers);
@@ -1218,7 +1224,7 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
             return;
           }
           const dirEntries = repo.dirEntries(ref, filePath);
-          if (dirEntries.length > 0 || repo.blobAtPath(ref, `${filePath}/__probe__`) !== undefined || dirProbe(repo, ref, filePath)) {
+          if (dirEntries.length > 0 || dirProbe(repo, ref, filePath)) {
             const entries = dirEntries.map((entry) => ({
               type: entry.mode === '40000' ? 'dir' : 'file',
               name: entry.name,
@@ -1334,7 +1340,8 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
         const sha = query.get('sha') ?? repo.defaultBranch;
         const commits = repo.commitHistory(sha, 100).map((oid) => {
           const commit = repo.objects.get(oid)!;
-          return { sha: oid, commit: { message: parseCommit(commit.data).message } };
+          const message = parseCommit(commit.data).message;
+          return { sha: oid, commit: { message: message.replace(/\n$/, '') } };
         });
         sendJson(res, 200, commits);
         return;

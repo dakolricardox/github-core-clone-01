@@ -186,8 +186,33 @@ interface FetchComputed {
 }
 
 export function computeFetchObjects(repo: Repository, req: FetchRequest): FetchComputed {
-  const haveClosure = new Set<string>(collectReachable(req.haves, (oid) => repo.objects.get(oid)));
-  for (const have of req.haves) haveClosure.add(have);
+  const shallowSet = new Set(req.shallow);
+  const haveClosure = new Set<string>();
+  // Objects the client already holds: a full closure from each `have`, but never crossing a
+  // shallow boundary (a shallow commit's parents are NOT held by the client).
+  const addHave = (root: string): void => {
+    const seen = new Set<string>();
+    const queue = [root];
+    while (queue.length) {
+      const cur = queue.pop()!;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      const obj = repo.objects.get(cur);
+      if (!obj) continue;
+      haveClosure.add(cur);
+      if (obj.type === 'commit') {
+        const c = parseCommit(obj.data);
+        queue.push(c.tree);
+        if (!shallowSet.has(cur)) for (const p of c.parents) queue.push(p);
+      } else if (obj.type === 'tree') {
+        for (const e of parseTree(obj.data)) if (e.mode !== '160000') queue.push(e.oid);
+      } else if (obj.type === 'tag') {
+        queue.push(peelTag((x) => repo.objects.get(x), cur));
+      }
+    }
+  };
+  for (const have of req.haves) addHave(have);
+
   const send = new Map<string, GitObject>();
   const boundaries: string[] = [];
 
