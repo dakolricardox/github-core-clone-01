@@ -25,9 +25,9 @@ if (ENV_URL === '') {
 }
 
 /** One register or done call may take this long before we give up on that attempt. */
-const CALL_TIMEOUT_MS = 30_000;
+const CALL_TIMEOUT_MS = 25_000;
 /** Backoff between attempts: it starts here and doubles, capped at BACKOFF_MAX_MS. */
-const BACKOFF_START_MS = 250;
+const BACKOFF_START_MS = 300;
 const BACKOFF_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
