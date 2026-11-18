@@ -31,6 +31,19 @@ export class Repository {
   readonly objects = new Map<string, GitObject>();
   readonly heads = new Map<string, string>(); // branch -> oid
   readonly tags = new Map<string, string>(); // tag -> oid
+
+  // Monotonic counter bumped on every git-state mutation (objects/heads/tags); drives the
+  // protocol-body caches below. Not a wall clock: purely a state-version.
+  version = 0;
+  // Cached smart-HTTP bodies, valid while protoVersion === version.
+  protoVersion = -1;
+  uploadV0: Buffer | null = null;
+  receiveV0: Buffer | null = null;
+  uploadInfoRefs: Buffer | null = null;
+  receiveInfoRefs: Buffer | null = null;
+  lsRefsCache: Map<string, Buffer> | null = null;
+  fetchCache: Map<string, { pack: Buffer; shallowBoundaries: string[] }> | null = null;
+  childOfCache: Map<string, string> | null = null;
   readonly labels = new Map<string, { name: string; color: string }>();
   readonly issues = new Map<number, Issue>();
   readonly pulls = new Map<number, PullRequest>();
@@ -55,8 +68,26 @@ export class Repository {
 
   putObject(type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.invalidateProtocol();
+    }
     return oid;
+  }
+
+  /** Drop every cached smart-HTTP body; call on any heads/tags/objects change. */
+  invalidateProtocol(): void {
+    this.version += 1;
+    if (this.protoVersion !== this.version) {
+      this.protoVersion = -1;
+      this.uploadV0 = null;
+      this.receiveV0 = null;
+      this.uploadInfoRefs = null;
+      this.receiveInfoRefs = null;
+      this.lsRefsCache = null;
+      this.fetchCache = null;
+      this.childOfCache = null;
+    }
   }
 
   hasObject(oid: string): boolean {
@@ -126,6 +157,7 @@ export class Repository {
     });
     const sha = this.putObject('commit', commit);
     this.heads.set(opts.branch, sha);
+    this.invalidateProtocol();
     // Collect blob shas for the reply (git blob id per changed path).
     const blobShas = new Map<string, string>();
     for (const change of opts.changes) {
@@ -195,19 +227,28 @@ export class Repository {
     return out;
   }
 
+  /** Direct parent of a commit, or undefined when absent/root/non-commit. */
+  parentOf(oid: string): string | undefined {
+    const commit = this.objects.get(oid);
+    if (!commit || commit.type !== 'commit') return undefined;
+    const parents = parseCommit(commit.data).parents;
+    return parents.length > 0 ? parents[0] : undefined;
+  }
+
   isAncestor(maybeAncestor: string, tip: string): boolean {
-    const seen = new Set<string>();
-    const queue: string[] = [tip];
-    while (queue.length) {
-      const current = queue.shift()!;
-      if (current === maybeAncestor) return true;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const commit = this.objects.get(current);
-      if (!commit || commit.type !== 'commit') continue;
-      for (const parent of parseCommit(commit.data).parents) queue.push(parent);
+    if (this.childOfCache === null) this.childOfCache = new Map();
+    const key = `${maybeAncestor}\u0000${tip}`;
+    const cached = this.childOfCache.get(key);
+    if (cached !== undefined) return cached === maybeAncestor;
+    let cursor = tip;
+    let hops = 0;
+    while (cursor && cursor !== maybeAncestor && hops < 4096) {
+      cursor = this.parentOf(cursor) ?? '';
+      hops += 1;
     }
-    return false;
+    const result = cursor === maybeAncestor;
+    this.childOfCache.set(key, result ? maybeAncestor : '');
+    return result;
   }
 
   // ---- labels / issues / pulls / comments ----
@@ -219,6 +260,7 @@ export class Repository {
 
   createIssue(title: string, body: string, labels: string[]): Issue {
     const number = this.nextIssueNumber++;
+    const createdAt = FORGE_EPOCH + number;
     const issue: Issue = {
       id: number,
       number,
@@ -226,7 +268,8 @@ export class Repository {
       body,
       state: 'open',
       labels: labels.map((name) => ({ name, color: this.labels.get(name)?.color ?? 'ededed' })),
-      createdAt: FORGE_EPOCH + number,
+      createdAt,
+      createdAtIso: new Date(createdAt * 1000).toISOString(),
     };
     this.issues.set(number, issue);
     return issue;
@@ -272,6 +315,7 @@ export interface Issue {
   state: 'open' | 'closed';
   labels: Array<{ name: string; color: string }>;
   createdAt: number;
+  createdAtIso: string;
 }
 
 export interface Comment {

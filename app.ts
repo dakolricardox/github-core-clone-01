@@ -23,12 +23,12 @@ import {
   buildLsRefs,
   buildPushReport,
   buildV0Advertisement,
-  buildV2Advertisement,
-  parseFetchArgs,
-  parsePushCommands,
   pktFlush,
   pktLine,
   tokenize,
+  V2_ADVERTISEMENT_BODY,
+  parseFetchArgs,
+  parsePushCommands,
   type PushReportResult,
 } from './lib/git.ts';
 
@@ -77,6 +77,17 @@ function queryOf(req: IncomingMessage): URLSearchParams {
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const declared = Number(req.headers['content-length'] ?? 0);
+  if (Number.isFinite(declared) && declared > 0 && declared <= 64 * 1024 * 1024) {
+    const out = Buffer.allocUnsafe(declared);
+    let filled = 0;
+    for await (const chunk of req) {
+      const c = chunk as Buffer;
+      c.copy(out, filled);
+      filled += c.length;
+    }
+    return filled === declared ? out : out.subarray(0, filled);
+  }
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);
@@ -118,7 +129,7 @@ function issueJson(repo: Repository, issue: Issue): Record<string, unknown> {
     state: issue.state,
     labels: issue.labels.map(labelJson),
     user: { login: repo.owner },
-    created_at: new Date(issue.createdAt * 1000).toISOString(),
+    created_at: issue.createdAtIso,
   };
 }
 
@@ -911,6 +922,7 @@ function mergePullInternal(repo: Repository, pull: PullRequest): void {
   pull.mergedAt = 1_700_000_100 + pull.number;
   pull.mergeCommitSha = mergeSha;
   if (pull.base && mergeSha) repo.heads.set(pull.base, mergeSha);
+  repo.invalidateProtocol();
 }
 
 function makeMergeCommit(repo: Repository, pull: PullRequest, headSha: string, baseSha: string): string {
@@ -1285,6 +1297,7 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
         if (ref.startsWith('refs/heads/')) {
           const branch = ref.slice('refs/heads/'.length);
           repo.heads.set(branch, sha);
+          repo.invalidateProtocol();
           sendJson(res, 201, { ref, object: { sha } });
           return;
         }
@@ -1533,6 +1546,7 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
         pull.mergedAt = 1_700_000_100 + pull.number;
         pull.mergeCommitSha = mergeSha;
         if (pull.base && mergeSha) repo.heads.set(pull.base, mergeSha);
+        repo.invalidateProtocol();
         sendJson(res, 200, { sha: mergeSha, merged: true, message: `Pull request successfully merged and closed` });
         return;
       }
@@ -1636,8 +1650,9 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
       sendError(res, 400, 'bad service');
       return;
     }
-    if (service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').includes('version=2')) {
-      const body = buildV2Advertisement();
+    const isV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').includes('version=2');
+    if (isV2) {
+      const body = V2_ADVERTISEMENT_BODY;
       res.writeHead(200, {
         'content-type': 'application/x-git-upload-pack-advertisement',
         'content-length': String(body.length),
@@ -1647,13 +1662,19 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
     }
     let body: Buffer;
     if (service === 'git-upload-pack') {
-      body = Buffer.concat([pktLine('# service=git-upload-pack\n'), pktFlush(), buildV0Advertisement(repo, 'git-upload-pack')]);
+      if (repo.uploadInfoRefs === null) {
+        repo.uploadInfoRefs = Buffer.concat([pktLine('# service=git-upload-pack\n'), pktFlush(), buildV0Advertisement(repo, 'git-upload-pack')]);
+      }
+      body = repo.uploadInfoRefs;
       res.writeHead(200, {
         'content-type': 'application/x-git-upload-pack-advertisement',
         'content-length': String(body.length),
       });
     } else {
-      body = Buffer.concat([pktLine('# service=git-receive-pack\n'), pktFlush(), buildV0Advertisement(repo, 'git-receive-pack')]);
+      if (repo.receiveInfoRefs === null) {
+        repo.receiveInfoRefs = Buffer.concat([pktLine('# service=git-receive-pack\n'), pktFlush(), buildV0Advertisement(repo, 'git-receive-pack')]);
+      }
+      body = repo.receiveInfoRefs;
       res.writeHead(200, {
         'content-type': 'application/x-git-receive-pack-advertisement',
         'content-length': String(body.length),
@@ -1675,7 +1696,7 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
 
   void (async () => {
     const body = await readBody(req);
-    const { tokens } = tokenize(body);
+    const { tokens, rest } = tokenize(body);
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '').includes('version=2');
       if (v2) {
@@ -1719,7 +1740,7 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
       return;
     }
     // receive-pack
-    const { commands, capabilities, pack } = parsePushCommands(tokens, body.subarray(body.length - restLen(body, tokens)));
+    const { commands, capabilities, pack } = parsePushCommands(tokens, rest);
     const report = applyPush(repo, commands, pack);
     const sideband = capabilities.includes('side-band-64k');
     const out = buildPushReport(report, sideband);
@@ -1728,12 +1749,6 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
   })().catch(() => {
     sendError(res, 500, 'internal error');
   });
-}
-
-function restLen(body: Buffer, tokens: { kind: string; payload: Buffer }[]): number {
-  // The pack starts after the first flush; tokenize already captured it, so recompute.
-  const { rest } = tokenize(body);
-  return rest.length;
 }
 
 // ---------------------------------------------------------------- GraphQL HTTP

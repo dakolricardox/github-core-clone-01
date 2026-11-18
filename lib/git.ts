@@ -15,8 +15,10 @@ export function pktLine(data: string | Uint8Array): Buffer {
 }
 
 export function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  return FLUSH;
 }
+
+const FLUSH = Buffer.from('0000', 'ascii');
 
 export function pktDelim(): Buffer {
   return Buffer.from('0001', 'ascii');
@@ -74,8 +76,21 @@ function sortedTags(repo: Repository): Array<[string, string]> {
   return [...repo.tags.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-/** v0 ref advertisement body (pkt-lines), without the smart preamble. */
+/** v0 ref advertisement body (pkt-lines), without the smart preamble. Cached per repo version. */
 export function buildV0Advertisement(repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  if (service === 'git-upload-pack') {
+    if (repo.uploadV0 !== null) return repo.uploadV0;
+    const body = buildV0AdvertisementUncached(repo, service);
+    repo.uploadV0 = body;
+    return body;
+  }
+  if (repo.receiveV0 !== null) return repo.receiveV0;
+  const body = buildV0AdvertisementUncached(repo, service);
+  repo.receiveV0 = body;
+  return body;
+}
+
+function buildV0AdvertisementUncached(repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const parts: Buffer[] = [];
   const headOid = repo.heads.get(repo.defaultBranch);
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
@@ -112,20 +127,34 @@ export function buildV0Advertisement(repo: Repository, service: 'git-upload-pack
 
 /** v2 capability advertisement body (starts with "version 2"). */
 export function buildV2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('agent=github-forge/1.0\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('server-option\n'),
-    pktFlush(),
-  ]);
+  return V2_ADVERTISEMENT_BODY;
 }
+
+export const V2_ADVERTISEMENT_BODY = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('agent=github-forge/1.0\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('server-option\n'),
+  pktFlush(),
+]);
 
 // ---------------------------------------------------------------- ls-refs (v2)
 
 export function buildLsRefs(repo: Repository, args: { prefixes: string[]; peel: boolean; symrefs: boolean; unborn: boolean }): Buffer {
+  const key = `${args.prefixes.join('\u0000')}\u0001${args.peel ? '1' : '0'}${args.symrefs ? '1' : '0'}${args.unborn ? '1' : '0'}`;
+  if (repo.lsRefsCache !== null) {
+    const hit = repo.lsRefsCache.get(key);
+    if (hit !== undefined) return hit;
+  }
+  const body = buildLsRefsUncached(repo, args);
+  if (repo.lsRefsCache === null) repo.lsRefsCache = new Map();
+  repo.lsRefsCache.set(key, body);
+  return body;
+}
+
+function buildLsRefsUncached(repo: Repository, args: { prefixes: string[]; peel: boolean; symrefs: boolean; unborn: boolean }): Buffer {
   const parts: Buffer[] = [];
   const matches = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   if (args.prefixes.length === 0) {
@@ -286,10 +315,28 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return out;
 }
 
-/** Build a v2 fetch response body. */
-export function buildFetchV2(repo: Repository, req: FetchRequest): Buffer {
+function fetchCacheKey(req: FetchRequest): string {
+  return `${req.wants.join('\u0000')}\u0001${req.haves.join('\u0000')}\u0001${req.shallow.join('\u0000')}\u0001${req.depth ?? ''}`;
+}
+
+/** Compute (and memoize) the pack + shallow boundaries for a fetch request. */
+function fetchPayload(repo: Repository, req: FetchRequest): { pack: Buffer; shallowBoundaries: string[] } {
+  const key = fetchCacheKey(req);
+  if (repo.fetchCache !== null) {
+    const hit = repo.fetchCache.get(key);
+    if (hit !== undefined) return hit;
+  }
   const { objects, shallowBoundaries } = computeFetchObjects(repo, req);
   const pack = writePack(objects);
+  const result = { pack, shallowBoundaries };
+  if (repo.fetchCache === null) repo.fetchCache = new Map();
+  repo.fetchCache.set(key, result);
+  return result;
+}
+
+/** Build a v2 fetch response body. */
+export function buildFetchV2(repo: Repository, req: FetchRequest): Buffer {
+  const { pack, shallowBoundaries } = fetchPayload(repo, req);
   const parts: Buffer[] = [];
   if (shallowBoundaries.length > 0) {
     parts.push(pktLine('shallow-info\n'));
@@ -304,8 +351,7 @@ export function buildFetchV2(repo: Repository, req: FetchRequest): Buffer {
 
 /** Build a v0 fetch response body (NAK + shallow lines + sideband pack). */
 export function buildFetchV0(repo: Repository, req: FetchRequest): Buffer {
-  const { objects, shallowBoundaries } = computeFetchObjects(repo, req);
-  const pack = writePack(objects);
+  const { pack, shallowBoundaries } = fetchPayload(repo, req);
   const parts: Buffer[] = [];
   for (const oid of shallowBoundaries) parts.push(pktLine(`shallow ${oid}\n`));
   parts.push(pktLine('NAK\n'));
@@ -385,6 +431,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
       if (command.newOid === ZERO_OID) {
         if (current !== undefined && current === command.oldOid) {
           repo.tags.delete(tag);
+          repo.invalidateProtocol();
           refs.push({ ref: command.ref, ok: true, reason: '' });
         } else {
           refs.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
@@ -392,6 +439,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
       } else if (command.oldOid === ZERO_OID) {
         if (current === undefined) {
           repo.tags.set(tag, command.newOid);
+          repo.invalidateProtocol();
           refs.push({ ref: command.ref, ok: true, reason: '' });
         } else {
           refs.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
@@ -402,6 +450,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
           refs.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
         } else {
           repo.tags.set(tag, command.newOid);
+          repo.invalidateProtocol();
           refs.push({ ref: command.ref, ok: true, reason: '' });
         }
       }
@@ -412,6 +461,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
       // delete
       if (current !== undefined && current === command.oldOid) {
         repo.heads.delete(command.ref.replace(/^refs\/heads\//, ''));
+        repo.invalidateProtocol();
         refs.push({ ref: command.ref, ok: true, reason: '' });
       } else {
         refs.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
@@ -422,6 +472,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
       // create
       if (current === undefined) {
         if (command.ref.startsWith('refs/heads/')) repo.heads.set(command.ref.slice('refs/heads/'.length), command.newOid);
+        repo.invalidateProtocol();
         refs.push({ ref: command.ref, ok: true, reason: '' });
       } else {
         refs.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
@@ -439,6 +490,7 @@ export function applyPush(repo: Repository, commands: PushCommand[], pack: Buffe
       continue;
     }
     if (command.ref.startsWith('refs/heads/')) repo.heads.set(command.ref.slice('refs/heads/'.length), command.newOid);
+    repo.invalidateProtocol();
     refs.push({ ref: command.ref, ok: true, reason: '' });
   }
 
