@@ -1718,7 +1718,7 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
 
   void (async () => {
     const body = await readBody(req);
-    const { tokens } = tokenize(body);
+    const { tokens, rest } = tokenize(body);
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '').includes('version=2');
       if (v2) {
@@ -1774,8 +1774,8 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
       return;
     }
     // receive-pack
-    const { commands, capabilities, pack } = parsePushCommands(tokens, body.subarray(body.length - restLen(body, tokens)));
-    const report = applyPush(repo, commands, pack);
+    const { commands, capabilities } = parsePushCommands(tokens, rest);
+    const report = applyPush(repo, commands, rest.length > 0 ? rest : null);
     const sideband = capabilities.includes('side-band-64k');
     const out = buildPushReport(report, sideband);
     res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result', 'content-length': String(out.length) });
