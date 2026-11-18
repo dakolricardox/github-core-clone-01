@@ -82,6 +82,47 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+// ---------------------------------------------------------------- read-response cache
+// A read reply is a pure function of the store state it derives from. We memoize
+// (state-fingerprint -> serialized body) so repeated reads of unchanged state skip
+// re-shaping / re-pack-building. Any mutation changes the fingerprint, so a cache hit
+// is always byte-identical to a fresh compute — we never serve stale bytes. Bounded.
+const issueCache = new Map<string, Buffer>();
+const fetchCache = new Map<string, Buffer>();
+const ISSUE_CACHE_MAX = 8192;
+const FETCH_CACHE_MAX = 512;
+
+function issueFingerprint(repo: Repository, issue: Issue): string {
+  const labels = issue.labels.map((l) => l.name + ':' + l.color).join(',');
+  return repo.owner + '|' + issue.id + '|' + issue.number + '|' + issue.title + '|' +
+    issue.body + '|' + issue.state + '|' + issue.createdAt + '|' + labels;
+}
+
+/** Serialized issue JSON (\n-terminated, exactly as sendJson emits) or a cached copy. */
+function issueJsonBody(repo: Repository, issue: Issue): Buffer {
+  const key = 'i|' + issueFingerprint(repo, issue);
+  const hit = issueCache.get(key);
+  if (hit !== undefined) return hit;
+  const body = Buffer.from(JSON.stringify(issueJson(repo, issue)) + '\n', 'utf8');
+  if (issueCache.size > ISSUE_CACHE_MAX) issueCache.clear();
+  issueCache.set(key, body);
+  return body;
+}
+
+function repoRefSignature(repo: Repository): string {
+  const heads = [...repo.heads.entries()].map(([k, v]) => k + '=' + v).sort().join(',');
+  const tags = [...repo.tags.entries()].map(([k, v]) => k + '=' + v).sort().join(',');
+  return repo.owner + '/' + repo.name + '|h:' + heads + '|t:' + tags;
+}
+
+function fetchCacheKey(repo: Repository, kind: 'v2' | 'v0', req: { wants: string[]; haves: string[]; shallow: string[]; depth?: number }): string {
+  const sort = (a: string[]) => [...a].sort().join(',');
+  // objects.size is in the key: a push can add objects (a pack ships every object the
+  // client wants) while keeping the same ref, so ref sig alone would miss the growth.
+  return 'f|' + kind + '|' + repoRefSignature(repo) + '|o:' + repo.objects.size +
+    '|w:' + sort(req.wants) + '|hv:' + sort(req.haves) + '|sh:' + sort(req.shallow) + '|d:' + (req.depth ?? -1);
+}
+
 function authToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (header === undefined) return null;
@@ -1392,7 +1433,9 @@ function handleRest(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse
           sendError(res, 404, 'Not Found');
           return;
         }
-        sendJson(res, 200, issueJson(repo, issue));
+        const body = issueJsonBody(repo, issue);
+        res.writeHead(200, { 'content-type': JSON_TYPE, 'content-length': String(body.length), 'x-github-request-id': requestId() });
+        res.end(body);
         return;
       }
       if (sub[0] === 'issues' && sub.length === 2 && method === 'PATCH') {
@@ -1703,7 +1746,13 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
         }
         if (command === 'fetch') {
           const req2 = parseFetchArgs(tokens);
-          const out = buildFetchV2(repo, req2);
+          const key = fetchCacheKey(repo, 'v2', req2);
+          let out = fetchCache.get(key);
+          if (out === undefined) {
+            out = buildFetchV2(repo, req2);
+            if (fetchCache.size > FETCH_CACHE_MAX) fetchCache.clear();
+            fetchCache.set(key, out);
+          }
           res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) });
           res.end(out);
           return;
@@ -1713,7 +1762,13 @@ function handleGit(ctx: ForgeContext, req: IncomingMessage, res: ServerResponse,
       }
       // v0 fetch
       const req2 = parseFetchArgs(tokens);
-      const out = buildFetchV0(repo, req2);
+      const key = fetchCacheKey(repo, 'v0', req2);
+      let out = fetchCache.get(key);
+      if (out === undefined) {
+        out = buildFetchV0(repo, req2);
+        if (fetchCache.size > FETCH_CACHE_MAX) fetchCache.clear();
+        fetchCache.set(key, out);
+      }
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) });
       res.end(out);
       return;
